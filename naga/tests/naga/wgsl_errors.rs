@@ -3860,6 +3860,21 @@ fn vector_logical_ops() {
 }
 
 #[test]
+fn short_circuit_const_rhs_still_type_checked() {
+    check_error_matches(
+        "const lhs = false;
+         const rhs = vec2(false, false);
+         const foo = lhs && rhs;",
+        "Incompatible operands: LogicalAnd(vec2<bool>, _)",
+    );
+
+    check_error_matches(
+        "const foo = false && array<bool, 1 - 2>()[0];",
+        "array element count must be positive (> 0)",
+    );
+}
+
+#[test]
 fn issue7165() {
     // Regression test for https://github.com/gfx-rs/wgpu/issues/7165
     let shader = "

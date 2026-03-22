@@ -754,6 +754,10 @@ impl ExpressionKindTracker {
         )
     }
 
+    pub(crate) fn kind_of_expr(&self, expr: &Expression) -> ExpressionKind {
+        self.type_of_with_expr(expr)
+    }
+
     fn type_of(&self, value: Handle<Expression>) -> ExpressionKind {
         self.inner[value]
     }
@@ -1102,8 +1106,26 @@ impl<'a> ConstantEvaluator<'a> {
             }
             _ => {
                 self.check(expr)?;
-                Ok(expr)
+                if self.is_evaluated_const_expression(expr) {
+                    Ok(expr)
+                } else {
+                    let span = self.expressions.get_span(expr);
+                    let expr = self.expressions[expr].clone();
+                    self.try_eval_and_append_impl(&expr, span)
+                }
             }
+        }
+    }
+
+    fn is_evaluated_const_expression(&self, expr: Handle<Expression>) -> bool {
+        match self.expressions[expr] {
+            Expression::Literal(_) | Expression::ZeroValue(_) | Expression::Constant(_) => true,
+            Expression::Compose { ref components, .. } => components
+                .iter()
+                .all(|&component| self.is_evaluated_const_expression(component)),
+            Expression::Splat { value, .. } => self.is_evaluated_const_expression(value),
+            Expression::Swizzle { vector, .. } => self.is_evaluated_const_expression(vector),
+            _ => false,
         }
     }
 
@@ -1178,6 +1200,15 @@ impl<'a> ConstantEvaluator<'a> {
                 }
             }
         }
+    }
+
+    pub(crate) fn append_unevaluated(
+        &mut self,
+        expr: Expression,
+        span: Span,
+    ) -> Handle<Expression> {
+        let kind = self.expression_kind_tracker.kind_of_expr(&expr);
+        self.append_expr(expr, span, kind)
     }
 
     /// Is the [`Self::expressions`] arena the global module expression arena?
@@ -1260,6 +1291,25 @@ impl<'a> ConstantEvaluator<'a> {
             }
             Expression::Binary { left, right, op } => {
                 let left = self.check_and_get(left)?;
+
+                if matches!(op, BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr) {
+                    let left = self.eval_zero_value_and_splat(left, span)?;
+                    if let Expression::Literal(Literal::Bool(left_value)) = self.expressions[left] {
+                        if op == BinaryOperator::LogicalAnd && !left_value {
+                            return self.register_evaluated_expr(
+                                Expression::Literal(Literal::Bool(false)),
+                                span,
+                            );
+                        }
+                        if op == BinaryOperator::LogicalOr && left_value {
+                            return self.register_evaluated_expr(
+                                Expression::Literal(Literal::Bool(true)),
+                                span,
+                            );
+                        }
+                    }
+                }
+
                 let right = self.check_and_get(right)?;
 
                 self.binary_op(op, left, right, span)

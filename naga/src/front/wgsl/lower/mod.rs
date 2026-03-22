@@ -29,6 +29,20 @@ mod construction;
 mod conversion;
 mod template_list;
 
+const fn should_suppress_const_eval_error(error: &proc::ConstantEvaluatorError) -> bool {
+    use proc::ConstantEvaluatorError as Cee;
+
+    matches!(
+        error,
+        Cee::InvalidMathArgValue(_)
+            | Cee::Overflow(_)
+            | Cee::AutomaticConversionLossy { .. }
+            | Cee::DivisionByZero
+            | Cee::RemainderByZero
+            | Cee::Literal(_)
+    )
+}
+
 /// Resolves the inner type of a given expression.
 ///
 /// Expects a &mut [`ExpressionContext`] and a [`Handle<Expression>`].
@@ -112,6 +126,8 @@ impl<'source> GlobalContext<'source, '_, '_> {
     const fn as_const(&mut self) -> ExpressionContext<'source, '_, '_> {
         ExpressionContext {
             enable_extensions: self.enable_extensions,
+            eager_const_eval: true,
+            suppress_const_eval_errors: false,
             ast_expressions: self.ast_expressions,
             globals: self.globals,
             module: self.module,
@@ -125,6 +141,8 @@ impl<'source> GlobalContext<'source, '_, '_> {
     const fn as_override(&mut self) -> ExpressionContext<'source, '_, '_> {
         ExpressionContext {
             enable_extensions: self.enable_extensions,
+            eager_const_eval: true,
+            suppress_const_eval_errors: false,
             ast_expressions: self.ast_expressions,
             globals: self.globals,
             module: self.module,
@@ -212,6 +230,8 @@ impl<'a, 'temp> StatementContext<'a, 'temp, '_> {
     {
         ExpressionContext {
             enable_extensions: self.enable_extensions,
+            eager_const_eval: true,
+            suppress_const_eval_errors: false,
             globals: self.globals,
             ast_expressions: self.ast_expressions,
             const_typifier: self.const_typifier,
@@ -239,6 +259,8 @@ impl<'a, 'temp> StatementContext<'a, 'temp, '_> {
     {
         ExpressionContext {
             enable_extensions: self.enable_extensions,
+            eager_const_eval: true,
+            suppress_const_eval_errors: false,
             globals: self.globals,
             ast_expressions: self.ast_expressions,
             const_typifier: self.const_typifier,
@@ -368,6 +390,8 @@ pub enum ExpressionContextType<'temp, 'out> {
 /// [`Expression::Constant`]: ir::Expression::Constant
 pub struct ExpressionContext<'source, 'temp, 'out> {
     enable_extensions: EnableExtensions,
+    eager_const_eval: bool,
+    suppress_const_eval_errors: bool,
 
     // WGSL AST values.
     ast_expressions: &'temp Arena<ast::Expression<'source>>,
@@ -438,6 +462,8 @@ impl<'source, 'temp, 'out> ExpressionContext<'source, 'temp, 'out> {
     const fn as_const(&mut self) -> ExpressionContext<'source, '_, '_> {
         ExpressionContext {
             enable_extensions: self.enable_extensions,
+            eager_const_eval: self.eager_const_eval,
+            suppress_const_eval_errors: self.suppress_const_eval_errors,
             globals: self.globals,
             ast_expressions: self.ast_expressions,
             const_typifier: self.const_typifier,
@@ -531,9 +557,40 @@ impl<'source, 'temp, 'out> ExpressionContext<'source, 'temp, 'out> {
         expr: ir::Expression,
         span: Span,
     ) -> Result<'source, Handle<ir::Expression>> {
+        if !self.eager_const_eval {
+            return Ok(self.append_expression_raw(expr, span));
+        }
+
         let mut eval = self.as_const_evaluator();
-        eval.try_eval_and_append(expr, span)
-            .map_err(|e| Box::new(Error::ConstantEvaluatorError(e.into(), span)))
+        match eval.try_eval_and_append(expr.clone(), span) {
+            Ok(handle) => Ok(handle),
+            Err(e) if self.suppress_const_eval_errors && should_suppress_const_eval_error(&e) => {
+                Ok(self.append_expression_raw(expr, span))
+            }
+            Err(e) => Err(Box::new(Error::ConstantEvaluatorError(e.into(), span))),
+        }
+    }
+
+    fn append_expression_raw(
+        &mut self,
+        expr: ir::Expression,
+        span: Span,
+    ) -> Handle<ir::Expression> {
+        match self.expr_type {
+            ExpressionContextType::Runtime(ref mut ctx)
+            | ExpressionContextType::Constant(Some(ref mut ctx)) => {
+                let kind = ctx.local_expression_kind_tracker.kind_of_expr(&expr);
+                let handle = ctx.function.expressions.append(expr, span);
+                ctx.local_expression_kind_tracker.insert(handle, kind);
+                handle
+            }
+            ExpressionContextType::Constant(None) | ExpressionContextType::Override => {
+                let kind = self.global_expression_kind_tracker.kind_of_expr(&expr);
+                let handle = self.module.global_expressions.append(expr, span);
+                self.global_expression_kind_tracker.insert(handle, kind);
+                handle
+            }
+        }
     }
 
     fn get_const_val<T: TryFrom<crate::Literal, Error = proc::ConstValueError>>(
@@ -571,6 +628,18 @@ impl<'source, 'temp, 'out> ExpressionContext<'source, 'temp, 'out> {
             Ect::Constant(None) | Ect::Override => {
                 self.global_expression_kind_tracker.is_const(handle)
             }
+        }
+    }
+
+    fn is_const_or_override(&self, handle: Handle<ir::Expression>) -> bool {
+        use ExpressionContextType as Ect;
+        match self.expr_type {
+            Ect::Runtime(ref ctx) | Ect::Constant(Some(ref ctx)) => ctx
+                .local_expression_kind_tracker
+                .is_const_or_override(handle),
+            Ect::Constant(None) | Ect::Override => self
+                .global_expression_kind_tracker
+                .is_const_or_override(handle),
         }
     }
 
@@ -632,9 +701,11 @@ impl<'source, 'temp, 'out> ExpressionContext<'source, 'temp, 'out> {
         }
     }
 
-    fn with_nested_runtime_expression_ctx<'a, F, T>(
+    fn with_nested_runtime_expression_ctx_config<'a, F, T>(
         &mut self,
         span: Span,
+        eager_const_eval: bool,
+        suppress_const_eval_errors: bool,
         f: F,
     ) -> Result<'source, (T, crate::Block)>
     where
@@ -662,6 +733,8 @@ impl<'source, 'temp, 'out> ExpressionContext<'source, 'temp, 'out> {
         };
         let mut nested_ctx = ExpressionContext {
             enable_extensions: self.enable_extensions,
+            eager_const_eval,
+            suppress_const_eval_errors,
             expr_type: ExpressionContextType::Runtime(nested_rctx),
             ast_expressions: self.ast_expressions,
             globals: self.globals,
@@ -676,6 +749,109 @@ impl<'source, 'temp, 'out> ExpressionContext<'source, 'temp, 'out> {
         rctx.emitter.start(&rctx.function.expressions);
 
         Ok((ret, block))
+    }
+
+    fn with_nested_runtime_expression_ctx<'a, F, T>(
+        &mut self,
+        span: Span,
+        f: F,
+    ) -> Result<'source, (T, crate::Block)>
+    where
+        for<'t> F: FnOnce(&mut ExpressionContext<'source, 't, 't>) -> Result<'source, T>,
+    {
+        self.with_nested_runtime_expression_ctx_config(
+            span,
+            self.eager_const_eval,
+            self.suppress_const_eval_errors,
+            f,
+        )
+    }
+
+    fn with_unevaluated_runtime_expression_ctx<'a, F, T>(&mut self, f: F) -> Result<'source, T>
+    where
+        for<'t> F: FnOnce(&mut ExpressionContext<'source, 't, 't>) -> Result<'source, T>,
+    {
+        match self.expr_type {
+            ExpressionContextType::Runtime(_) | ExpressionContextType::Constant(Some(_)) => {
+                let mut block = crate::Block::new();
+                let rctx = match self.expr_type {
+                    ExpressionContextType::Runtime(ref mut rctx)
+                    | ExpressionContextType::Constant(Some(ref mut rctx)) => rctx,
+                    ExpressionContextType::Constant(None) | ExpressionContextType::Override => {
+                        unreachable!()
+                    }
+                };
+
+                rctx.block
+                    .extend(rctx.emitter.finish(&rctx.function.expressions));
+                rctx.emitter.start(&rctx.function.expressions);
+
+                let nested_rctx = LocalExpressionContext {
+                    local_table: rctx.local_table,
+                    function: rctx.function,
+                    block: &mut block,
+                    emitter: rctx.emitter,
+                    typifier: rctx.typifier,
+                    local_expression_kind_tracker: rctx.local_expression_kind_tracker,
+                };
+                let mut nested_ctx = ExpressionContext {
+                    enable_extensions: self.enable_extensions,
+                    eager_const_eval: true,
+                    suppress_const_eval_errors: true,
+                    expr_type: ExpressionContextType::Runtime(nested_rctx),
+                    ast_expressions: self.ast_expressions,
+                    globals: self.globals,
+                    module: self.module,
+                    const_typifier: self.const_typifier,
+                    layouter: self.layouter,
+                    global_expression_kind_tracker: self.global_expression_kind_tracker,
+                };
+                let ret = f(&mut nested_ctx)?;
+
+                block.extend(rctx.emitter.finish(&rctx.function.expressions));
+                rctx.emitter.start(&rctx.function.expressions);
+                Ok(ret)
+            }
+            ExpressionContextType::Constant(None) | ExpressionContextType::Override => {
+                let local_table = FastHashMap::default();
+                let mut function = ir::Function {
+                    name: None,
+                    arguments: Vec::new(),
+                    result: None,
+                    local_variables: Arena::new(),
+                    expressions: Arena::new(),
+                    named_expressions: crate::NamedExpressions::default(),
+                    body: ir::Block::default(),
+                    diagnostic_filter_leaf: None,
+                };
+                let mut block = crate::Block::new();
+                let mut emitter = proc::Emitter::default();
+                emitter.start(&function.expressions);
+                let mut typifier = Typifier::default();
+                let mut local_expression_kind_tracker = proc::ExpressionKindTracker::new();
+                let nested_rctx = LocalExpressionContext {
+                    local_table: &local_table,
+                    function: &mut function,
+                    block: &mut block,
+                    emitter: &mut emitter,
+                    typifier: &mut typifier,
+                    local_expression_kind_tracker: &mut local_expression_kind_tracker,
+                };
+                let mut nested_ctx = ExpressionContext {
+                    enable_extensions: self.enable_extensions,
+                    eager_const_eval: true,
+                    suppress_const_eval_errors: true,
+                    expr_type: ExpressionContextType::Runtime(nested_rctx),
+                    ast_expressions: self.ast_expressions,
+                    globals: self.globals,
+                    module: self.module,
+                    const_typifier: self.const_typifier,
+                    layouter: self.layouter,
+                    global_expression_kind_tracker: self.global_expression_kind_tracker,
+                };
+                f(&mut nested_ctx)
+            }
+        }
     }
 
     fn gather_component(
@@ -2559,6 +2735,34 @@ impl<'source, 'temp> Lowerer<'source, 'temp> {
         );
 
         if ctx.is_runtime() {
+            let left_val: Option<bool> = ctx.get_const_val(left).ok();
+            if left_val.is_some_and(|left_val| {
+                op == crate::BinaryOperator::LogicalAnd && !left_val
+                    || op == crate::BinaryOperator::LogicalOr && left_val
+            }) {
+                let right_inner = ctx.with_unevaluated_runtime_expression_ctx(|ctx| {
+                    let right = self.expression_for_abstract(right, ctx)?;
+                    Ok(resolve_inner!(ctx, right).clone())
+                })?;
+
+                if right_inner != crate::TypeInner::Scalar(crate::Scalar::BOOL) {
+                    return Err(Box::new(Error::InvalidResolve(
+                        proc::ResolveError::IncompatibleOperands(format!(
+                            "{op:?}({:?}, _)",
+                            right_inner.for_debug(&ctx.module.types),
+                        )),
+                    )));
+                }
+
+                return Ok(Typed::Plain(ctx.get(left).clone()));
+            }
+
+            if ctx.is_const_or_override(left) {
+                let right = self.expression_for_abstract(right, ctx)?;
+                ctx.grow_types(right)?;
+                return Ok(Typed::Plain(crate::Expression::Binary { op, left, right }));
+            }
+
             // To simulate short-circuiting behavior, we want to generate IR
             // like the following for `&&`. For `||`, the condition is `!_lhs`
             // and the else value is `true`.
@@ -2650,12 +2854,19 @@ impl<'source, 'temp> Lowerer<'source, 'temp> {
                     || op == crate::BinaryOperator::LogicalOr && left_val
             }) {
                 // Short-circuit behavior: don't evaluate the RHS.
+                let right_inner = ctx.with_unevaluated_runtime_expression_ctx(|ctx| {
+                    let right = self.expression_for_abstract(right, ctx)?;
+                    Ok(resolve_inner!(ctx, right).clone())
+                })?;
 
-                // TODO(https://github.com/gfx-rs/wgpu/issues/8440): We shouldn't ignore the
-                // RHS completely, it should still be type-checked. Preserving it for type
-                // checking is a bit tricky, because we're trying to produce an expression
-                // for a const context, but the RHS is allowed to have things that aren't
-                // const.
+                if right_inner != crate::TypeInner::Scalar(crate::Scalar::BOOL) {
+                    return Err(Box::new(Error::InvalidResolve(
+                        proc::ResolveError::IncompatibleOperands(format!(
+                            "{op:?}({:?}, _)",
+                            right_inner.for_debug(&ctx.module.types),
+                        )),
+                    )));
+                }
 
                 Ok(Typed::Plain(ctx.get(left).clone()))
             } else {

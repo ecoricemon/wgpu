@@ -47,6 +47,29 @@ pub enum PipelineConstantError {
     NegativeMeshOutputMax,
 }
 
+const fn should_defer_const_eval_error(error: &ConstantEvaluatorError) -> bool {
+    matches!(
+        error,
+        ConstantEvaluatorError::InvalidMathArgValue(_)
+            | ConstantEvaluatorError::Overflow(_)
+            | ConstantEvaluatorError::AutomaticConversionLossy { .. }
+            | ConstantEvaluatorError::DivisionByZero
+            | ConstantEvaluatorError::RemainderByZero
+            | ConstantEvaluatorError::Literal(_)
+    )
+}
+
+const fn may_defer_expression_error(expr: &Expression, error: &ConstantEvaluatorError) -> bool {
+    should_defer_const_eval_error(error)
+        && !matches!(
+            expr,
+            Expression::Binary {
+                op: crate::BinaryOperator::LogicalAnd | crate::BinaryOperator::LogicalOr,
+                ..
+            }
+        )
+}
+
 /// Compact `module` and replace all overrides with constants.
 ///
 /// `module` must be valid. Both compaction and constant evaluation may produce
@@ -219,7 +242,13 @@ pub fn process_overrides<'a>(
             false,
         );
         adjust_expr(&adjusted_global_expressions, &mut expr);
-        let h = evaluator.try_eval_and_append(expr, span)?;
+        let h = match evaluator.try_eval_and_append(expr.clone(), span) {
+            Ok(h) => h,
+            Err(error) if may_defer_expression_error(&expr, &error) => {
+                evaluator.append_unevaluated(expr, span)
+            }
+            Err(error) => return Err(error.into()),
+        };
         adjusted_global_expressions.insert(old_h, h);
     }
 
@@ -278,6 +307,8 @@ pub fn process_overrides<'a>(
     }
     module.entry_points = entry_points;
     module.overrides = overrides;
+
+    compact(&mut module, KeepUnused::No);
 
     // Now that we've rewritten all the expressions, we need to
     // recompute their types and other metadata. For the time being,
@@ -451,7 +482,13 @@ fn process_function(
             expr = Expression::Constant(override_map[h]);
         }
         adjust_expr(&adjusted_local_expressions, &mut expr);
-        let h = evaluator.try_eval_and_append(expr, span)?;
+        let h = match evaluator.try_eval_and_append(expr.clone(), span) {
+            Ok(h) => h,
+            Err(error) if may_defer_expression_error(&expr, &error) => {
+                evaluator.append_unevaluated(expr, span)
+            }
+            Err(error) => return Err(error),
+        };
         adjusted_local_expressions.insert(old_h, h);
     }
 

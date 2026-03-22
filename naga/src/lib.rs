@@ -158,3 +158,16 @@ pub type FastIndexMap<K, V> =
 
 /// Map of expressions that have associated variable names
 pub(crate) type NamedExpressions = FastIndexMap<Handle<Expression>, String>;
+
+#[test]
+fn aaa() {
+    let code = "
+const lhs = false;
+const rhs = vec2(false, false);
+const foo = lhs && rhs;
+";
+
+    let module = front::wgsl::parse_str(code).unwrap();
+    let mut v = valid::Validator::new(valid::ValidationFlags::all(), Default::default());
+    v.validate(&module).unwrap();
+}
